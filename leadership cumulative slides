@@ -1,0 +1,461 @@
+# leadership_cumulative_slides.R
+# Create a leadership-ready deck from your person-level export with stage date columns.
+
+# ---- Packages ----
+library(readr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(lubridate)
+library(gt)
+library(ggplot2)
+library(ggthemes)
+
+# Optional (choose ONE path below):
+# A) Google Slides
+#  install.packages("googleslidesR")
+#  library(googleAuthR); library(googleslidesR)
+# B) PowerPoint alternative
+#   install.packages("officer")
+#   library(officer)
+
+# ---- Config (edit these) ----
+in_csv      <- "C:/Users/Todd/Dropbox/Daily Export/totalfunnelexport.csv"  # same export you used
+curr_fy     <- 2026
+prev_fy     <- 2025
+cutoff_date <- Sys.Date()  # calendar-aligned; prev FY uses same month/day
+cut_prev    <- cutoff_date - years(1)
+org_name    <- "Muhlenberg College — GCE"
+
+# Output files (always saved)
+out_dir      <- "C:/Users/Todd/weekly_yoy_twofile/R Renders for Senior Leadership"
+img_kpi_png  <- file.path(out_dir, "lead_kpis.png")
+img_tbl_png  <- file.path(out_dir, "program_table.png")
+
+# Optional Google Slides target (uncomment path A below if you want Slides)
+slides_title <- sprintf("GCE Cumulative Funnel — FY%d vs FY%d (through %s)",
+                        curr_fy, prev_fy, format(cutoff_date, "%b %d"))
+
+# Optional PowerPoint fallback
+pptx_path <- file.path(out_dir, sprintf("GCE_Cumulative_Funnel_FY%d_vs_FY%d.pptx", curr_fy, prev_fy))
+
+# ---- Style ----
+okabe_ito <- c("#E69F00","#56B4E9","#009E73","#F0E442",
+               "#0072B2","#D55E00","#CC79A7","#000000")
+col_pos <- "#009E73"  # bluish green
+col_neg <- "#D55E00"  # vermillion
+
+# ---- Helpers ----
+term_to_fy <- function(term_chr) {
+  yr <- str_extract(term_chr %||% "", "\\b\\d{4}\\b")
+  suppressWarnings(as.integer(yr))
+}
+
+program_group_major <- function(major) {
+  m <- tolower(trimws(ifelse(is.na(major), "", major)))
+  
+  noncredit_titles <- c("Essential Grant Writing",
+                        "Project Management Certificate",
+                        "DEIB Professional Certificate")
+  
+  is_grad          <- str_detect(m, "master") | str_detect(m, "graduate certificate")
+  is_accel         <- str_detect(m, "accelerated")
+  is_non_degree    <- str_detect(m, "\\bnon\\s*-?degree\\b")
+  is_noncredit_any <- Reduce(`|`, lapply(noncredit_titles, function(t) str_detect(m, fixed(t, ignore_case = TRUE))), init = FALSE)
+  
+  is_pm_standalone <- str_detect(m, "project management") &
+    !str_detect(m, "accelerated") &
+    !str_detect(m, "bachelor") &
+    !str_detect(m, "certificate")
+  
+  dplyr::case_when(
+    is_grad ~ "Graduate programs (all)",
+    is_accel ~ "Accelerated Degree Completion (all concentrations)",
+    is_non_degree | is_noncredit_any | is_pm_standalone ~ "Non-credit",
+    TRUE ~ "Continuing Studies"
+  )
+}
+
+# --- REPLACE your parse_any_date() with this ---
+parse_any_date <- function(x) {
+  # Fast paths: already Date/POSIXt/numeric (Excel)
+  if (inherits(x, "Date"))    return(x)
+  if (inherits(x, c("POSIXct","POSIXt"))) return(as.Date(x))
+  if (is.numeric(x)) return(as.Date(as.numeric(x), origin = "1899-12-30"))
+  
+  # Character path (handles ISO8601 with offsets, ymd, mdy)
+  x_chr <- trimws(as.character(x))
+  x_chr[x_chr == ""] <- NA_character_
+  
+  d <- suppressWarnings(coalesce(
+    readr::parse_datetime(x_chr, locale = readr::locale(tz = "UTC")), # very tolerant RFC3339/ISO8601
+    ymd_hms(x_chr, quiet = TRUE, tz = "UTC"),
+    ymd(x_chr),
+    mdy(x_chr)
+  ))
+  as.Date(d)
+}
+
+
+# ---- Stage column resolver (handles duplicates like "Date of Inquiry...7") ----
+pick_date_col <- function(df, base) {
+  if (base %in% names(df)) return(base)
+  cands <- names(df)[str_detect(names(df), paste0("^", fixed(base)))]
+  if (length(cands)) return(cands[1])
+  stop("Missing expected column starting with '", base, "'.")
+
+  
+}
+
+# ---- Load data ----
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+raw <- read_csv(in_csv, show_col_types = FALSE)
+
+term_col  <- if ("Active Term - Calculated" %in% names(raw)) "Active Term - Calculated" else "Active.Term...Calculated"
+major_col <- if ("Active Major - Calculated" %in% names(raw)) "Active Major - Calculated" else "Active.Major...Calculated"
+
+# Resolve an Active Funnel Stage column (robust to variants)
+stage_status_col <- dplyr::case_when(
+  "Active Funnel Stage - Calculated" %in% names(raw) ~ "Active Funnel Stage - Calculated",
+  "Active.Funnel.Stage...Calculated" %in% names(raw) ~ "Active.Funnel.Stage...Calculated",
+  "Active Funnel Stage" %in% names(raw) ~ "Active Funnel Stage",
+  TRUE ~ NA_character_
+)
+
+bad_status_regex <- "(?i)withdraw|cancel|declin|deny|refund"
+
+suspect_col  <- pick_date_col(raw, "Record Created Date")          # Suspects
+prospect_col <- pick_date_col(raw, "Date of Inquiry")              # Prospects
+appstart_col <- pick_date_col(raw, "Application Start Date")       # Applications (starts)
+submit_col  <- pick_date_col(raw, "Application Submit Date")       # Submits
+admit_col    <- pick_date_col(raw, "Admitted Date")                # Admits
+deposit_col  <- pick_date_col(raw, "Deposited Date")               # Deposits
+
+# --- NEW: normalize resolved stage columns so downstream parsing never chokes ---
+stage_cols_resolved <- c(suspect_col, prospect_col, appstart_col, submit_col, admit_col, deposit_col)
+
+for (cc in stage_cols_resolved) {
+  v <- raw[[cc]]
+  if (inherits(v, c("POSIXct","POSIXt"))) v <- format(v, "%Y-%m-%dT%H:%M:%S%z")  # preserve tz info
+  if (inherits(v, "Date"))                v <- format(v, "%Y-%m-%d")
+  raw[[cc]] <- as.character(v)  # ensure character for parse_any_date()
+}
+
+
+df <- raw %>%
+  mutate(
+    FY      = as.integer(term_to_fy(.data[[term_col]])),
+    Program = program_group_major(.data[[major_col]])
+  ) %>%
+  filter(!is.na(FY), FY %in% c(prev_fy, curr_fy))
+
+
+
+
+# Map "Applications" to SUBMIT date now; we DROP "Submits" as a separate stage
+stage_map <- tribble(
+  ~Stage,        ~col,
+  "Suspects",     suspect_col,
+  "Prospects",    prospect_col,
+  "Applications", submit_col,   # <-- now counting SUBMITS here
+  "Admits",       admit_col,
+  "Deposits",     deposit_col
+)
+
+counts <- lapply(seq_len(nrow(stage_map)), function(i) {
+  stg <- stage_map$Stage[i]
+  col <- stage_map$col[i]
+  
+  dd <- df %>%
+    mutate(StageDate = parse_any_date(.data[[col]])) %>%
+    filter(!is.na(StageDate))
+  
+  # Exclude withdrawn/cancelled/etc. for Deposits only (if status col available)
+  if (!is.na(stage_status_col) && stg == "Deposits") {
+    dd <- dd %>%
+      filter(!str_detect(.data[[stage_status_col]] %||% "", bad_status_regex))
+  }
+  
+  dd %>%
+    filter(
+      (FY == curr_fy & StageDate <= cutoff_date) |
+        (FY == prev_fy & StageDate <= cut_prev)
+    ) %>%
+    count(Program, FY, name = "n") %>%
+    mutate(Stage = stg)
+})
+
+
+all_counts <- bind_rows(counts)
+
+# complete grid & pivot
+long_full <- all_counts %>%
+  complete(
+    Program,
+    FY = c(prev_fy, curr_fy),
+    Stage = c("Suspects","Prospects","Applications","Admits","Deposits"),
+    fill = list(n = 0)
+  )
+
+wide <- long_full %>%
+  pivot_wider(names_from = c(Stage, FY), values_from = n, values_fill = 0)
+
+
+
+# ---------- Conversion rates (FY<curr> + Δpp vs FY<prev>) ----------
+safe_div <- function(num, den) ifelse(den == 0, NA_real_, num / den)
+getv <- function(stage, fy) {
+  nm <- paste0(stage, "_", fy)
+  if (!nm %in% names(wide)) return(rep(0, nrow(wide)))
+  wide[[nm]]
+}
+
+build_rates <- function(curr_fy, prev_fy) {
+  S_cur <- getv("Suspects",     curr_fy); S_prv <- getv("Suspects",     prev_fy)
+  P_cur <- getv("Prospects",    curr_fy); P_prv <- getv("Prospects",    prev_fy)
+  A_cur <- getv("Applications", curr_fy); A_prv <- getv("Applications", prev_fy)  # <-- submits
+  Adm_cur <- getv("Admits",     curr_fy); Adm_prv <- getv("Admits",     prev_fy)
+  Dep_cur <- getv("Deposits",   curr_fy); Dep_prv <- getv("Deposits",   prev_fy)
+  
+  tibble(
+    Program = wide$Program,
+    
+    `Inquiry Rate FY{curr_fy}`   = safe_div(P_cur, S_cur),
+    `Inquiry Rate Δpp`           = (safe_div(P_cur, S_cur) - safe_div(P_prv, S_prv)) * 100,
+    
+    # Now Applications are SUBMITS, so this is Submit/Prospect
+    `Application Rate FY{curr_fy}` = safe_div(A_cur, P_cur),
+    `Application Rate Δpp`         = (safe_div(A_cur, P_cur) - safe_div(A_prv, P_prv)) * 100,
+    
+    `Admit Rate FY{curr_fy}`     = safe_div(Adm_cur, A_cur),     # admits / submits
+    `Admit Rate Δpp`             = (safe_div(Adm_cur, A_cur) - safe_div(Adm_prv, A_prv)) * 100,
+    
+    `Deposit Rate FY{curr_fy}`   = safe_div(Dep_cur, Adm_cur),
+    `Deposit Rate Δpp`           = (safe_div(Dep_cur, Adm_cur) - safe_div(Dep_prv, Adm_prv)) * 100
+  )
+}
+
+rates_tbl <- build_rates(curr_fy, prev_fy)
+
+
+# Order and TOTAL row from totals (not avg of rates)
+present_order <- c(
+  "Non-credit",
+  "Continuing Studies",
+  "Accelerated Degree Completion (all concentrations)",
+  "Graduate programs (all)"
+)
+
+rates_tbl <- rates_tbl %>%
+  arrange(factor(Program, levels = c(present_order, setdiff(sort(unique(Program)), present_order)), ordered = TRUE))
+
+
+# TOTAL recomputed from totals for each ratio
+totals_row <- {
+  S_cur_T <- sum(getv("Suspects", curr_fy)); S_prv_T <- sum(getv("Suspects", prev_fy))
+  P_cur_T <- sum(getv("Prospects", curr_fy)); P_prv_T <- sum(getv("Prospects", prev_fy))
+  A_cur_T <- sum(getv("Applications", curr_fy)); A_prv_T <- sum(getv("Applications", prev_fy))  # submits
+  Adm_cur_T <- sum(getv("Admits", curr_fy)); Adm_prv_T <- sum(getv("Admits", prev_fy))
+  Dep_cur_T <- sum(getv("Deposits", curr_fy)); Dep_prv_T <- sum(getv("Deposits", prev_fy))
+  
+  tibble(
+    Program = "TOTAL",
+    `Inquiry Rate FY{curr_fy}`    = safe_div(P_cur_T, S_cur_T),
+    `Inquiry Rate Δpp`            = (safe_div(P_cur_T, S_cur_T) - safe_div(P_prv_T, S_prv_T)) * 100,
+    `Application Rate FY{curr_fy}`= safe_div(A_cur_T, P_cur_T),
+    `Application Rate Δpp`        = (safe_div(A_cur_T, P_cur_T) - safe_div(A_prv_T, P_prv_T)) * 100,
+    `Admit Rate FY{curr_fy}`      = safe_div(Adm_cur_T, A_cur_T),
+    `Admit Rate Δpp`              = (safe_div(Adm_cur_T, A_cur_T) - safe_div(Adm_prv_T, A_prv_T)) * 100,
+    `Deposit Rate FY{curr_fy}`    = safe_div(Dep_cur_T, Adm_cur_T),
+    `Deposit Rate Δpp`            = (safe_div(Dep_cur_T, Adm_cur_T) - safe_div(Dep_prv_T, Adm_prv_T)) * 100
+  )
+}
+rates_tbl <- bind_rows(rates_tbl, totals_row)
+
+
+
+
+# ---- Build leadership tables (counts, Δ, %Δ) ----
+mk_tbl <- function() {
+  stages_in_order <- c("Suspects","Prospects","Applications","Admits","Deposits")
+  
+  out <- tibble(Program = wide$Program)
+  for (stg in stages_in_order) {  # use the same vector here
+    cur <- getv(stg, curr_fy); prv <- getv(stg, prev_fy)
+    out[[paste0(stg, " FY", curr_fy)]] <- cur
+    out[[paste0(stg, " FY", prev_fy)]] <- prv
+    out[[paste0(stg, " Δ(FY", curr_fy, "-FY", prev_fy, ")")]] <- cur - prv
+    out[[paste0(stg, " %Δ")]] <- ifelse(prv == 0, NA_real_, (cur - prv) / prv)
+  }
+  
+  # use stages_in_order instead of stages
+  out <- out %>%
+    arrange(
+      factor(
+        Program,
+        levels = c(
+          stages_in_order,
+          setdiff(sort(unique(Program)), stages_in_order)
+        ),
+        ordered = TRUE
+      )
+    )
+  
+  tot <- out %>%
+    summarise(across(where(is.numeric), sum, na.rm = TRUE)) %>%
+    mutate(Program = "TOTAL", .before = 1)
+  
+  for (stg in stages_in_order) {
+    cur_total <- tot[[paste0(stg, " FY", curr_fy)]]
+    prv_total <- tot[[paste0(stg, " FY", prev_fy)]]
+    tot[[paste0(stg, " %Δ")]] <- if (prv_total == 0) NA_real_ else (cur_total - prv_total) / prv_total
+  }
+  
+  bind_rows(out, tot)
+}
+
+final_tbl <- mk_tbl()
+
+# Keep only FY<curr> and %Δ; interleave
+stages_in_order <- c("Suspects","Prospects","Applications","Admits","Deposits")
+keep_cols <- c(
+  "Program",
+  as.vector(rbind(
+    paste0(stages_in_order, " FY", curr_fy),
+    paste0(stages_in_order, " %Δ")
+  ))
+)
+keep_cols <- keep_cols[keep_cols %in% names(final_tbl)]
+
+final_tbl <- final_tbl %>%
+  dplyr::select(dplyr::any_of(keep_cols)) %>%
+  dplyr::mutate(dplyr::across(dplyr::ends_with("%Δ"), as.numeric))
+
+
+# Keep only FY<curr> and %Δ; interleave as [Stage FY2025, Stage %Δ]
+stages_in_order <- c("Suspects","Prospects","Applications","Admits","Deposits")
+
+keep_cols <- c(
+  "Program",
+  as.vector(rbind(
+    paste0(stages_in_order, " FY", curr_fy),
+    paste0(stages_in_order, " %Δ")
+  ))
+)
+
+# Filter only those columns that actually exist in final_tbl
+keep_cols <- keep_cols[keep_cols %in% names(final_tbl)]
+
+final_tbl <- final_tbl %>%
+  dplyr::select(dplyr::any_of(keep_cols)) %>%
+  dplyr::mutate(dplyr::across(dplyr::ends_with("%Δ"), as.numeric))
+
+
+
+
+
+# ---- KPI table (FY<curr> + %Δ only) ----
+kpi <- final_tbl %>%
+  dplyr::filter(Program == "TOTAL") %>%
+  dplyr::select(-Program) %>%
+  tidyr::pivot_longer(everything(), names_to = "Metric", values_to = "Value") %>%
+  tidyr::separate(Metric, into = c("Stage","Type"), sep = " ", extra = "merge") %>%
+  tidyr::pivot_wider(names_from = Type, values_from = Value) %>%
+  dplyr::select(
+    Stage,
+    !!paste0("FY", curr_fy),
+    "%Δ"
+  ) %>%
+  dplyr::mutate(`%Δ` = as.numeric(`%Δ`))
+
+kpi_gt <- kpi %>%
+  gt() %>%
+  tab_header(
+    title = gt::md(sprintf("**Cumulative Funnel — FY%s & %%Δ**", curr_fy, prev_fy)),
+    subtitle = gt::md(sprintf("Through %s · %s", format(cutoff_date, "%b %d"), org_name))
+  ) %>%
+  fmt_number(columns = !!paste0("FY", curr_fy), decimals = 0, sep_mark = ",") %>%
+  data_color(
+    columns = "%Δ",
+    colors  = scales::col_bin(
+      palette = c("#D55E00", "#f0f0f0", "#009E73"),
+      domain  = c(-1, 0, 1),
+      bins    = c(-Inf, -1e-9, 1e-9, Inf)
+    )
+  ) %>%
+  fmt_percent(columns = "%Δ", decimals = 1) %>%
+  tab_options(table.width = pct(100))
+
+
+
+# ---- One table: FY<curr> + %Δ, side-by-side per stage ----
+prog_tbl <- final_tbl  # already trimmed & ordered above
+
+prog_gt <- prog_tbl %>%
+  gt() %>%
+  tab_header(
+    title = gt::md(sprintf("**Cumulative Funnel — FY%s & %%Δ**", curr_fy, prev_fy)),
+    subtitle = gt::md(sprintf("Through %s · %s", format(cutoff_date, "%b %d"), org_name))
+  ) %>%
+  # format numbers/percents
+  fmt_number(columns = dplyr::matches(paste0(" FY", curr_fy, "$")),
+             decimals = 0, sep_mark = ",") %>%
+  data_color(
+    columns = dplyr::ends_with("%Δ"),
+    colors  = scales::col_bin(
+      palette = c("#D55E00", "#f0f0f0", "#009E73"),
+      domain  = c(-1, 0, 1),
+      bins    = c(-Inf, -1e-9, 1e-9, Inf)
+    )
+  ) %>%
+  fmt_percent(columns = dplyr::ends_with("%Δ"), decimals = 1) %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = Program == "TOTAL")
+  ) %>%
+  tab_options(table.width = pct(100))
+
+# ---------- Simple conversion rates table (no color coding) ----------
+rates_simple_gt <- rates_tbl %>%
+  gt() %>%
+  tab_header(
+    title = gt::md(sprintf("**Conversion Rates — FY%s & Δpp vs FY%s**", curr_fy, prev_fy)),
+    subtitle = gt::md(sprintf("Through %s · %s", format(cutoff_date, "%b %d"), org_name))
+  ) %>%
+  cols_align(align = "left", columns = everything()) %>%
+  fmt_percent(columns = matches(paste0(" FY\\{", curr_fy, "\\}$")), decimals = 1) %>%
+  fmt(columns = ends_with("Δpp"),
+      fns = function(x) ifelse(is.na(x), "—", sprintf("%+.1f pp", x))) %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = Program == "TOTAL")
+  ) %>%
+  tab_options(table.width = pct(100))
+
+
+
+# Optional: save alongside your other images
+# gtsave(rates_simple_gt, file.path(out_dir, "conversion_rates.png"), expand = 5)
+
+
+# gtsave(prog_gt, img_tbl_png, expand = 5)
+
+
+# Just print the gt table object in the console
+kpi_gt
+prog_gt
+
+html_file <- tempfile(fileext = ".html")
+
+gtsave(
+  data = kpi_gt %>% tab_options(table.width = pct(30)),
+  filename = html_file)
+
+browseURL(html_file) # opens in your browser, can zoom freely
+
+# Preview right under your cumulative table
+rates_simple_gt
+
+# Save images (PNG)
+#gtsave(kpi_gt, img_kpi_png, expand = 5)
+#gtsave(prog_gt, img_tbl_png, expand = 5)
